@@ -1,2 +1,3 @@
-# LLM-Network-packets-trace
-a simple tool to gnerate network packets auto
+# Generating Network Packet Traces with Large Language Models(LLMs)
+a simple tool to gnerate network packets automatically
+
