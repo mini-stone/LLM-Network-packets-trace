@@ -8,7 +8,7 @@ Cornell ECE 6960 — Fall 2025
 This project explores how **Large Language Models (LLMs)** can generate realistic **network packet traces** without fine-tuning.  
 Instead of relying on diffusion or GAN models such as [NetDiffusion](https://dl.acm.org/doi/10.1145/3639037) or [NetShare](https://github.com/netsharecmu/NetShare), this work evaluates whether general-purpose LLMs (ChatGPT, Gemini, Llama 3.1) can synthesize valid, protocol-compliant traces through **prompt engineering** and **in-context learning**.
 
-Generated traces are first produced in **JSON format** for interpretability and validation, then converted into **PCAP** for visualization and quantitative analysis.
+Generated traces are first produced in **JSON format** for interpretability and validation, then converted into **PCAP** for quantitative analysis.
 
 ---
 
@@ -30,7 +30,7 @@ llm_packet_trace/
 │   └── ...
 ├── baseline/                  # baseline
 │   ├── sample.json
-│   └── smaple.pcap
+│   └── sample.pcap
 ├── validator/                 # validity 
 │   └── validate_trace.py
 ├── evaluator/                 # quality/utility evaluating
