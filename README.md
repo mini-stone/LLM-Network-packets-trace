@@ -1,6 +1,6 @@
 # 🧠 LLM-Generated Network Packet Traces
 Cornell ECE 6960 — Fall 2025  
-**Author:** Hubery Yin (hy668)
+**Author:** Hetao Yin (hy668)
 
 ---
 
