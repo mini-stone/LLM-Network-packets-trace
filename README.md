@@ -24,15 +24,23 @@ Generated traces are first produced in **JSON format** for interpretability and 
 
 ```text
 llm_packet_trace/
-├── generated_trace.json        # LLM textual output (intermediate)
-├── generated_trace.pcap        # Converted PCAP file (final output)
-├── trace_validator.py          # Protocol correctness checker
-├── json_to_pcap.py             # Scapy-based converter
-├── metrics_eval.py             # Optional: quality metrics
+├── generated/                 # LLM gnerated data
+│   ├── trace_001.json
+│   ├── trace_001.pcap
+│   └── ...
+├── baseline/                  # baseline
+│   ├── sample.json
+│   └── smaple.pcap
+├── validator/                 # validity 
+│   └── validate_trace.py
+├── evaluator/                 # quality/utility evaluating
+│   └── evaluator.py
+├── utils/
+│   └── json_to_pcap.py        # JSON→PCAP
+├── llm_generate.py
+├── prompt.txt
 └── README.md
 ```
-
-> Tip: keep filenames in `snake_case` to avoid Markdown escaping issues.
 
 ---
 
@@ -71,10 +79,10 @@ llm_packet_trace/
 
 ## ⚙️ Conversion and Validation
 
-### 1️⃣ Validate Trace
+### 1️⃣ Generate network packet trace
 
 ```bash
-python trace_validator.py generated_trace.json
+python llm_generate.py generated_trace.json
 ```
 
 Checks include: TCP flag sequence (SYN → SYN-ACK → ACK), IP/Port pair consistency, SEQ/ACK matching, timestamp ordering.
@@ -83,34 +91,6 @@ Checks include: TCP flag sequence (SYN → SYN-ACK → ACK), IP/Port pair consis
 
 ```bash
 python json_to_pcap.py generated_trace.json generated_trace.pcap
-```
-
-**Example – `json_to_pcap.py`:**
-
-```python
-from scapy.all import *
-import json, sys
-
-infile, outfile = sys.argv[1], sys.argv[2]
-with open(infile) as f:
-    packets = json.load(f)
-
-pkts = []
-for p in packets:
-    ip = IP(src=p["src_ip"], dst=p["dst_ip"])
-    if p["protocol"] == "TCP":
-        l4 = TCP(sport=p["src_port"], dport=p["dst_port"],
-                 flags=p["flags"], seq=p["seq"], ack=p["ack"])
-    elif p["protocol"] == "UDP":
-        l4 = UDP(sport=p["src_port"], dport=p["dst_port"])
-    else:
-        continue
-    payload = p.get("payload", "")
-    pkt = ip / l4 / Raw(load=payload)
-    pkts.append(pkt)
-
-wrpcap(outfile, pkts)
-print(f"✅ {outfile} created successfully")
 ```
 
 ### 3️⃣ Visualize and Compare
@@ -139,19 +119,3 @@ tshark -r generated_trace.pcap -T json > parsed_trace.json
 
 ---
 
-## 🧠 Key Difference vs Previous Work
-
-|  | Traditional Models (GAN/Diffusion) | This LLM Project |
-|:-|:-|:-|
-| Generation Basis | Statistical distributions | Protocol semantics + prompt control |
-| Interpretability | Low | High (JSON readable) |
-| Protocol Compliance | Mask/constraint based | LLM reasoning based |
-| Zero-shot Adaptability | Weak | Strong |
-
----
-
-## 💡 Formatting Notes (if your GitHub view looks broken)
-- Make sure **code blocks are fenced** with triple backticks and a language hint (e.g., `json`, `python`, `bash`).
-- Leave a **blank line** before and after lists, code blocks, and headings.
-- Avoid mixing tabs and spaces; use **LF** line endings on macOS/Linux (or let Git normalize endings).
-- Save as **UTF-8**; GitHub handles emoji automatically.
