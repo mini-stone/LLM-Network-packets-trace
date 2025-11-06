@@ -106,7 +106,6 @@ The workflow of this project follows four main stages:
 - SEQ / ACK continuity  
 - Payload and field sanity
 ---
----
 ## 📊 Evaluation Metrics
 - Packet size distribution
 - Inter-arrival time
