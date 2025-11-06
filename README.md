@@ -99,6 +99,14 @@ The workflow of this project follows four main stages:
    and assesses whether the synthetic traces are useful for downstream ML or network analysis tasks.
 
 ---
+## 🧩 Validation Metrics
+- Timestamp consistency  
+- IP / Port pairing  
+- TCP state-machine validity  
+- SEQ / ACK continuity  
+- Payload and field sanity
+---
+---
 ## 📊 Evaluation Metrics
 - Packet size distribution
 - Inter-arrival time
