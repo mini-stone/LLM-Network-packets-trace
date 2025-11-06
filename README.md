@@ -77,32 +77,28 @@ llm_packet_trace/
 
 ---
 
-## ⚙️ Conversion and Validation
+## ⚙️ Execution Pipeline
 
-### 1️⃣ Generate network packet trace
+The workflow of this project follows four main stages:
 
-```bash
-python llm_generate.py generated_trace.json
-```
+1️⃣ **Generate (LLM → JSON)**  
+   The LLM produces synthetic packet traces in JSON format according to the prompt description.  
+   Each packet entry contains timestamps, IP addresses, ports, flags, and optional payloads.
 
-Checks include: TCP flag sequence (SYN → SYN-ACK → ACK), IP/Port pair consistency, SEQ/ACK matching, timestamp ordering.
+2️⃣ **Validate (Protocol Correctness)**  
+   The generated trace is checked for logical and protocol consistency.  
+   Validation ensures correct TCP flag sequences, IP/port matching, SEQ/ACK continuity, and proper timestamp ordering.
 
-### 2️⃣ Convert to PCAP
+3️⃣ **Convert (JSON → PCAP)**  
+   After validation, the JSON trace is transformed into a standard PCAP file.  
+   This allows visualization and analysis in network tools such as Wireshark or tcpdump.
 
-```bash
-python json_to_pcap.py generated_trace.json generated_trace.pcap
-```
-
-### 3️⃣ Visualize and Compare
-
-Open the PCAP in Wireshark, or use CLI:
-
-```bash
-tshark -r generated_trace.pcap -T json > parsed_trace.json
-```
+4️⃣ **Evaluate (Quality and Utility)**  
+   The resulting PCAP file is compared against real-world baseline traces (e.g., IMC10 or CAIDA).  
+   Evaluation measures statistical similarity in packet size and timing distributions,  
+   and assesses whether the synthetic traces are useful for downstream ML or network analysis tasks.
 
 ---
-
 ## 📊 Evaluation Metrics
 - Packet size distribution
 - Inter-arrival time
