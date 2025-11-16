@@ -107,11 +107,30 @@ The workflow of this project follows four main stages:
 - Payload and field sanity
 ---
 ## 📊 Evaluation Metrics
-- Packet size distribution
-- Inter-arrival time
-- Flag sequence probability
-- Protocol field entropy
-- Distance to real trace (KL / Wasserstein)
+1. Statistical Fidelity
+
+Measures how well the generated traffic matches the global statistical characteristics of real-world traces.
+This includes the preservation of distributional shapes, variability, and overall traffic intensity at the aggregate level.
+
+2. Temporal Dynamics
+
+Evaluates whether the time-dependent behavior of the generated trace reflects realistic network activity.
+Key aspects include burstiness, idle/spike patterns, temporal correlations, and long-range dependencies commonly observed in production systems.
+
+3. Protocol Behavior Consistency
+
+Assesses whether generated packets follow valid and coherent protocol semantics.
+This includes adherence to state machines (e.g., TCP handshake/teardown), correct request–response structures, and the absence of protocol-invalid transitions.
+
+4. Semantic Realism
+
+Examines whether the generated traces exhibit application-level behaviors that are plausible in real scenarios.
+Examples include realistic sequences of DNS resolution, HTTP fetches, or client/server communication patterns.
+
+5. Distance to Real Trace
+
+Quantifies the similarity between real and generated traces using statistical distance measures such as KL divergence, Jensen–Shannon divergence, or Wasserstein distance.
+These metrics provide a principled, distribution-level comparison without relying on handcrafted heuristics.
 
 ---
 
