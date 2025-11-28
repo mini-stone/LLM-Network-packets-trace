@@ -1,36 +1,53 @@
 #!/usr/bin/env python3
 """
-baseline/build_baseline_from_pcap.py
+utils/build_baseline.py
 
-从老师给的大 PCAP 中自动抽取“通信最频繁的一对主机”，
-生成项目需要的 baseline 文件：
+从 baseline/ 下的原始多主机 PCAP 中，自动为每个文件选出
+“通信包数最多的一对 IP（host pair）”，只保留这两个主机之间的
+TCP/UDP 包，并输出：
 
-- baseline/sample.pcap             # 只包含这两台主机的流量（给 evaluator 用）
-- baseline/demo/two_hosts_demo.json  # 同样数据的 JSON 版本（给 LLM 做 in-context 示例）
+  baseline/processed/<pcap名>_pair.pcap   # 过滤后的两主机 PCAP
+  baseline/demo/<pcap名>.json             # 对应 JSON baseline
+
+JSON packet 格式（与项目统一）：
+
+{
+  "timestamp": <float>,
+  "protocol": "TCP" or "UDP",
+  "src_ip": "<string>",
+  "dst_ip": "<string>",
+  "src_port": <int>,
+  "dst_port": <int>,
+  "flags": "<string>",
+  "seq": <int>,
+  "ack": <int>,
+  "payload": "<string>"
+}
 """
 
-import json
-from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Dict, Any, List, Tuple
+from collections import Counter
+import json
 
 from scapy.all import rdpcap, wrpcap, IP, TCP, UDP, Raw  # type: ignore
 
-ROOT = Path(__file__).resolve().parent
-DEMO_DIR = ROOT / "demo"
-DEMO_DIR.mkdir(exist_ok=True)
+ROOT = Path(__file__).resolve().parents[1]
+BASELINE_DIR = ROOT / "baseline"
+DEMO_DIR = BASELINE_DIR / "demo"
+PROCESSED_DIR = BASELINE_DIR / "processed"
 
 PacketJSON = Dict[str, Any]
 HostPair = Tuple[str, str]
 
 
 def _normalize_pair(ip1: str, ip2: str) -> HostPair:
-    """无向主机对（小的在前），方便统计 A<->B 的总流量。"""
+    """无向 host pair（排序后），方便把 A↔B 两个方向合并统计。"""
     return tuple(sorted((ip1, ip2)))
 
 
 def _find_top_host_pair(pcap_path: Path) -> HostPair:
-    """在 PCAP 中找到出现包数最多的一对主机 (IP, IP)。"""
+    """在一个 PCAP 里找到通信包数最多的一对 IP。"""
     pkts = rdpcap(str(pcap_path))
     counter: Counter[HostPair] = Counter()
 
@@ -42,26 +59,33 @@ def _find_top_host_pair(pcap_path: Path) -> HostPair:
         counter[pair] += 1
 
     if not counter:
-        raise RuntimeError("No IP packets found in the PCAP.")
+        raise RuntimeError(f"No IP packets found in {pcap_path}")
 
-    (best_pair, _count) = counter.most_common(1)[0]
+    best_pair, _ = counter.most_common(1)[0]
     return best_pair
 
 
-def _pcap_to_json_for_pair(
-    pcap_path: Path,
-    pair: HostPair,
-) -> List[PacketJSON]:
-    """
-    只保留指定 host pair 的 TCP/UDP 包，生成 JSON packet 列表。
-    时间戳使用 PCAP 原始 timestamp。
-    """
+def _flags_to_string(tcp) -> str:
+    """scapy TCP flags → 'SYN-ACK' 这种字符串。"""
+    flags = int(tcp.flags)
+    parts = []
+    if flags & 0x02: parts.append("SYN")
+    if flags & 0x10: parts.append("ACK")
+    if flags & 0x01: parts.append("FIN")
+    if flags & 0x08: parts.append("PSH")
+    if flags & 0x04: parts.append("RST")
+    return "-".join(parts) if parts else ""
+
+
+def _pcap_to_pair_json(pcap_path: Path, pair: HostPair) -> List[PacketJSON]:
+    """只保留指定 host pair 的 TCP/UDP 包，转成 JSON 列表。"""
     pkts = rdpcap(str(pcap_path))
-    result: List[PacketJSON] = []
+    out: List[PacketJSON] = []
 
     for pkt in pkts:
         if IP not in pkt:
             continue
+
         ip = pkt[IP]
         src = ip.src
         dst = ip.dst
@@ -69,34 +93,21 @@ def _pcap_to_json_for_pair(
             continue
 
         ts = float(getattr(pkt, "time", 0.0))
+
         proto = "OTHER"
         sport = 0
         dport = 0
         flags_str = ""
         seq = 0
         ack = 0
-        payload_str = ""
+        payload = ""
 
         if TCP in pkt:
             tcp = pkt[TCP]
             proto = "TCP"
             sport = int(tcp.sport)
             dport = int(tcp.dport)
-
-            flags = int(tcp.flags)
-            parts = []
-            if flags & 0x02:
-                parts.append("SYN")
-            if flags & 0x10:
-                parts.append("ACK")
-            if flags & 0x01:
-                parts.append("FIN")
-            if flags & 0x08:
-                parts.append("PSH")
-            if flags & 0x04:
-                parts.append("RST")
-            flags_str = "-".join(parts) if parts else ""
-
+            flags_str = _flags_to_string(tcp)
             seq = int(tcp.seq)
             ack = int(tcp.ack)
         elif UDP in pkt:
@@ -105,18 +116,17 @@ def _pcap_to_json_for_pair(
             sport = int(udp.sport)
             dport = int(udp.dport)
         else:
-            # 非 TCP/UDP 就忽略（你的项目本来只支持这两个协议）
+            # 项目只支持 TCP/UDP，其他协议直接跳过
             continue
 
-        # 负载：尽量 decode 成字符串
         if Raw in pkt:
-            raw_bytes: bytes = bytes(pkt[Raw].load)
+            raw = bytes(pkt[Raw].load)
             try:
-                payload_str = raw_bytes.decode("utf-8", errors="ignore")
+                payload = raw.decode("utf-8", errors="ignore")
             except Exception:
-                payload_str = ""
+                payload = ""
 
-        pkt_json: PacketJSON = {
+        out.append({
             "timestamp": ts,
             "protocol": proto,
             "src_ip": src,
@@ -126,17 +136,15 @@ def _pcap_to_json_for_pair(
             "flags": flags_str,
             "seq": seq,
             "ack": ack,
-            "payload": payload_str,
-        }
-        result.append(pkt_json)
+            "payload": payload,
+        })
 
-    # 保证按时间排序（一般 PCAP 本来就是按时间，但这里再稳一遍）
-    result.sort(key=lambda p: p["timestamp"])
-    return result
+    out.sort(key=lambda p: p["timestamp"])
+    return out
 
 
 def _filter_pcap_for_pair(pcap_path: Path, pair: HostPair, out_pcap: Path) -> None:
-    """把只包含这两台主机的 IP 包写入新的 PCAP 文件。"""
+    """把只属于该 host pair 的 IP 包写到新的 pcap 里。"""
     pkts = rdpcap(str(pcap_path))
     selected = []
 
@@ -148,41 +156,50 @@ def _filter_pcap_for_pair(pcap_path: Path, pair: HostPair, out_pcap: Path) -> No
             selected.append(pkt)
 
     if not selected:
-        raise RuntimeError(f"No packets for host pair {pair} in PCAP.")
+        raise RuntimeError(f"No packets for host pair {pair} in {pcap_path}")
 
     wrpcap(str(out_pcap), selected)
 
 
+def build_baselines_for_all_pcaps() -> None:
+    """对 baseline/ 下所有 .pcap 文件自动生成 baseline。"""
+    if not BASELINE_DIR.is_dir():
+        raise SystemExit(f"baseline directory not found: {BASELINE_DIR}")
+
+    DEMO_DIR.mkdir(exist_ok=True)
+    PROCESSED_DIR.mkdir(exist_ok=True)
+
+    pcap_files = sorted(BASELINE_DIR.glob("*.pcap"))
+    if not pcap_files:
+        raise SystemExit(f"No .pcap files found in {BASELINE_DIR}")
+
+    print(f"[info] Found {len(pcap_files)} pcap files in {BASELINE_DIR}")
+
+    for pcap_path in pcap_files:
+        print(f"\n[info] Processing {pcap_path.name} ...")
+
+        # 1. 找这个文件里最活跃的 host pair
+        pair = _find_top_host_pair(pcap_path)
+        print(f"[info]   Most active host pair: {pair[0]} <-> {pair[1]}")
+
+        # 2. 过滤出该 pair 的 pcap
+        out_pcap = PROCESSED_DIR / f"{pcap_path.stem}_pair.pcap"
+        _filter_pcap_for_pair(pcap_path, pair, out_pcap)
+        print(f"[info]   Filtered PCAP written to {out_pcap}")
+
+        # 3. 把这个 pair 的流量转成 JSON baseline
+        json_packets = _pcap_to_pair_json(pcap_path, pair)
+        out_json = DEMO_DIR / f"{pcap_path.stem}.json"
+        out_json.write_text(json.dumps(json_packets, indent=2), encoding="utf-8")
+        print(f"[info]   JSON baseline written to {out_json} (packets={len(json_packets)})")
+
+    print("\n[done] All baselines built.")
+
+
 def main() -> None:
-    # 你老师给的大 PCAP 文件名，自行改成真实文件名
-    # 比如 baseline/teacher_trace.pcap
-    teacher_pcap = ROOT / "teacher_trace.pcap"
-    if not teacher_pcap.is_file():
-        raise SystemExit(
-            f"Teacher PCAP not found: {teacher_pcap}\n"
-            "请把老师给的 pcap 放到 baseline/ 目录，并改名为 teacher_trace.pcap，"
-            "或者直接改脚本里的文件名。"
-        )
-
-    print(f"[info] Using teacher PCAP: {teacher_pcap}")
-
-    # 1. 找到通信最多的那一对主机
-    top_pair = _find_top_host_pair(teacher_pcap)
-    print(f"[info] Most active host pair: {top_pair[0]} <-> {top_pair[1]}")
-
-    # 2. 生成 JSON baseline demo
-    json_packets = _pcap_to_json_for_pair(teacher_pcap, top_pair)
-    demo_json_path = DEMO_DIR / "two_hosts_demo.json"
-    demo_json_path.write_text(json.dumps(json_packets, indent=2), encoding="utf-8")
-    print(f"[info] JSON baseline demo written to {demo_json_path}")
-
-    # 3. 生成只包含该 host pair 的 PCAP → sample.pcap
-    sample_pcap_path = ROOT / "sample.pcap"
-    _filter_pcap_for_pair(teacher_pcap, top_pair, sample_pcap_path)
-    print(f"[info] Baseline sample PCAP written to {sample_pcap_path}")
-
-    print("[done] Baseline construction finished.")
+    build_baselines_for_all_pcaps()
 
 
 if __name__ == "__main__":
     main()
+
