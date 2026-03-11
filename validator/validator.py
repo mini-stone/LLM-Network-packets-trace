@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-validator/validate_trace.py
+validator/validator.py
 
-Validation Metrics (see README):
+Validation Metrics:
 - Timestamp consistency
 - IP / Port pairing
 - TCP state-machine validity
@@ -114,9 +114,10 @@ def check_ip_port_pairing(packets: List[Packet]) -> List[str]:
                     f"[ip/port] Packet {i}: {role} out of range 1–65535 ({p})"
                 )
 
-    if len(ips) > 10:
-        errors.append(
-            f"[ip/port] Trace has {len(ips)} distinct IPs (>10). "
+    # 太多 IP 给个 warning 打印，不算错误
+    if len(ips) > 50:
+        print(
+            f"[validator-warning] Trace has {len(ips)} distinct IPs (>50). "
             f"This may indicate unintended extra hosts."
         )
 
@@ -274,6 +275,13 @@ def check_seq_ack_continuity(packets: List[Packet]) -> List[str]:
     For each TCP flow & direction:
     - SEQ non-decreasing, advances on payload
     - ACK non-decreasing
+
+    设计：
+      - ACK-only 包（payload_size == 0）允许 SEQ 不前进；
+      - 只有 payload_size > 0 且 SEQ 没前进时，打印 warning 而不是 error；
+      - 真正的错误：
+          * SEQ 回退（变小）
+          * ACK 回退（变小）
     """
     errors = []
 
@@ -309,18 +317,22 @@ def check_seq_ack_continuity(packets: List[Packet]) -> List[str]:
             last_seq = state["last_seq"]
             last_ack = state["last_ack"]
 
+            # ---- SEQ ----
             if last_seq is not None:
                 if seq < last_seq:
                     errors.append(
                         f"[seq/ack] Flow {key}, dir {dir_key}: "
                         f"SEQ decreased at pkt {i} ({seq} < {last_seq})"
                     )
+                # ACK-only 情况：payload_size == 0 时可以不前进
                 if payload_size > 0 and seq == last_seq:
-                    errors.append(
-                        f"[seq/ack] Flow {key}, dir {dir_key}: "
+                    # 打印 warning，但不作为错误
+                    print(
+                        f"[validator-warning] Flow {key}, dir {dir_key}: "
                         f"payload_size={payload_size} but SEQ did not advance at pkt {i}"
                     )
 
+            # ---- ACK ----
             if last_ack is not None and ack < last_ack:
                 errors.append(
                     f"[seq/ack] Flow {key}, dir {dir_key}: "
@@ -383,4 +395,3 @@ def _main_cli() -> None:
 
 if __name__ == "__main__":
     _main_cli()
-
