@@ -1,327 +1,397 @@
 #!/usr/bin/env python3
 """
-evaluator/evaluator.py
+validator/validator.py
 
-High-level evaluation for LLM-generated network packet traces (PCAP).
-Implements the Evaluation Metrics described in README:
-
-1. Statistical Fidelity
-2. Temporal Dynamics
-3. Protocol Behavior Consistency
-4. Semantic Realism
-5. Distance to Real Trace
+Validation Metrics:
+- Timestamp consistency
+- IP / Port pairing
+- TCP state-machine validity
+- SEQ / ACK continuity
+- Payload and field sanity
 """
 
-from typing import Dict, Any, List, Tuple
+import argparse
+import json
+import sys
+import ipaddress
+from typing import List, Dict, Tuple, Any
 
-import numpy as np
-from scapy.all import rdpcap, IP, TCP, UDP  # type: ignore
+Packet = Dict[str, Any]
 
 
-FlowKey = Tuple[str, int, str, int, str]
+# -------------------- Loader -------------------- #
+
+def load_trace(path: str) -> List[Packet]:
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    if not isinstance(data, list):
+        raise ValueError("Top-level JSON must be a list of packet objects.")
+
+    if not data:
+        raise ValueError("Trace is empty (no packets).")
+
+    return data
 
 
-# -------------------- PCAP Parsing & Feature Extraction -------------------- #
-
-def _get_flow_key(ip_src: str, ip_dst: str, sport: int, dport: int, proto: str) -> FlowKey:
+def get_flow_key(pkt: Packet) -> Tuple[str, int, str, int, str]:
     """
-    Normalize 5-tuple as a flow key:
-    (min_ip, min_port, max_ip, max_port, proto)
-    so that both directions share the same key.
+    Normalize a 5-tuple as a flow key:
+    (min_ip, min_port, max_ip, max_port, protocol)
+
+    Both directions of the same flow share one key.
     """
-    a = (ip_src, int(sport))
-    b = (ip_dst, int(dport))
+    proto = str(pkt.get("protocol", "")).upper()
+    src_ip, dst_ip = pkt.get("src_ip"), pkt.get("dst_ip")
+    src_port, dst_port = pkt.get("src_port"), pkt.get("dst_port")
+
+    a = (src_ip, int(src_port))
+    b = (dst_ip, int(dst_port))
     (ip1, p1), (ip2, p2) = sorted([a, b], key=lambda x: (x[0], x[1]))
     return (ip1, p1, ip2, p2, proto)
 
 
-def _parse_pcap(path: str) -> Dict[str, Any]:
-    """
-    Load a PCAP file and extract basic statistics needed for evaluation:
+# -------------------- Individual Checks -------------------- #
 
-    - packet lengths
-    - timestamps + inter-arrival times
-    - per-flow statistics (pkt count, duration)
-    - simple TCP handshake stats
-    - protocol counts (TCP/UDP/OTHER)
-    """
-    pkts = rdpcap(path)
+def check_timestamp_consistency(packets: List[Packet]) -> List[str]:
+    errors = []
+    prev_ts = None
 
-    lengths: List[float] = []
-    timestamps: List[float] = []
-    protocol_counts = {"TCP": 0, "UDP": 0, "OTHER": 0}
-
-    flows: Dict[FlowKey, Dict[str, Any]] = {}
-    tcp_handshake_total = 0
-    tcp_handshake_ok = 0
-
-    for pkt in pkts:
-        # PCAP timestamp
-        ts = float(getattr(pkt, "time", 0.0))
-        timestamps.append(ts)
-
-        # Packet length
-        lengths.append(float(len(pkt)))
-
-        # Check if the packet has IP layer
-        if IP not in pkt:
-            protocol_counts["OTHER"] += 1
+    for i, pkt in enumerate(packets):
+        ts = pkt.get("timestamp", None)
+        if not isinstance(ts, (int, float)):
+            errors.append(f"[timestamp] Packet {i}: timestamp not a number ({ts!r})")
             continue
 
-        ip = pkt[IP]
-        ip_src = ip.src
-        ip_dst = ip.dst
+        if ts < 0:
+            errors.append(f"[timestamp] Packet {i}: timestamp is negative ({ts})")
 
-        proto = "OTHER"
-        sport = 0
-        dport = 0
+        if prev_ts is not None and ts <= prev_ts:
+            errors.append(
+                f"[timestamp] Packet {i}: timestamp {ts} not strictly increasing "
+                f"(previous {prev_ts})"
+            )
 
-        tcp_layer = None
-        udp_layer = None
+        prev_ts = ts
 
-        if TCP in pkt:
-            tcp_layer = pkt[TCP]
-            proto = "TCP"
-            sport = int(tcp_layer.sport)
-            dport = int(tcp_layer.dport)
-        elif UDP in pkt:
-            udp_layer = pkt[UDP]
-            proto = "UDP"
-            sport = int(udp_layer.sport)
-            dport = int(udp_layer.dport)
+    return errors
 
-        if proto in protocol_counts:
-            protocol_counts[proto] += 1
-        else:
-            protocol_counts["OTHER"] += 1
 
-        flow_key = _get_flow_key(ip_src, ip_dst, sport, dport, proto)
-        flow = flows.get(
-            flow_key,
-            {
-                "pkt_count": 0,
-                "first_ts": ts,
-                "last_ts": ts,
-                "tcp_syn": False,
-                "tcp_syn_ack": False,
-                "tcp_ack_after_syn": False,
-            },
+def check_ip_port_pairing(packets: List[Packet]) -> List[str]:
+    """
+    - IP must be syntactically valid.
+    - Port must be in [1, 65535].
+    - Optionally warn if the trace has too many distinct hosts.
+    """
+    errors = []
+    ips = set()
+
+    for i, pkt in enumerate(packets):
+        src_ip = pkt.get("src_ip")
+        dst_ip = pkt.get("dst_ip")
+        src_port = pkt.get("src_port")
+        dst_port = pkt.get("dst_port")
+
+        # IP validity
+        for role, ip in (("src_ip", src_ip), ("dst_ip", dst_ip)):
+            try:
+                ipaddress.ip_address(ip)
+            except Exception:
+                errors.append(f"[ip/port] Packet {i}: {role} invalid ({ip!r})")
+            else:
+                ips.add(ip)
+
+        # Port validity
+        for role, port in (("src_port", src_port), ("dst_port", dst_port)):
+            try:
+                p = int(port)
+            except (TypeError, ValueError):
+                errors.append(f"[ip/port] Packet {i}: {role} not an integer ({port!r})")
+                continue
+
+            if not (1 <= p <= 65535):
+                errors.append(
+                    f"[ip/port] Packet {i}: {role} out of range 1–65535 ({p})"
+                )
+
+    # 太多 IP 给个 warning 打印，不算错误
+    if len(ips) > 50:
+        print(
+            f"[validator-warning] Trace has {len(ips)} distinct IPs (>50). "
+            f"This may indicate unintended extra hosts."
         )
 
-        flow["pkt_count"] += 1
-        flow["first_ts"] = min(flow["first_ts"], ts)
-        flow["last_ts"] = max(flow["last_ts"], ts)
+    return errors
 
-        # Track simple TCP handshake flags
-        if proto == "TCP" and tcp_layer is not None:
-            flags = int(tcp_layer.flags)
-            syn = bool(flags & 0x02)
-            ack = bool(flags & 0x10)
 
-            if syn and not ack:
-                flow["tcp_syn"] = True
-            elif syn and ack:
-                flow["tcp_syn_ack"] = True
-            elif ack and not syn and flow.get("tcp_syn") and flow.get("tcp_syn_ack"):
-                flow["tcp_ack_after_syn"] = True
+def check_payload_and_field_sanity(packets: List[Packet]) -> List[str]:
+    """
+    Basic schema & type checks:
+    - Required keys present
+    - Types of protocol / flags / seq / ack / payload
+    """
+    errors = []
+    required_keys = [
+        "timestamp",
+        "protocol",
+        "src_ip",
+        "dst_ip",
+        "src_port",
+        "dst_port",
+        "flags",
+        "seq",
+        "ack",
+        "payload",  # README uses payload as string
+    ]
 
-        flows[flow_key] = flow
+    for i, pkt in enumerate(packets):
+        # Required fields
+        for k in required_keys:
+            if k not in pkt:
+                errors.append(f"[fields] Packet {i}: missing required field '{k}'")
 
-    # Compute TCP handshake stats per flow
-    for key, f in flows.items():
-        if key[4] != "TCP":
+        protocol = pkt.get("protocol")
+        if not isinstance(protocol, str):
+            errors.append(f"[fields] Packet {i}: 'protocol' not a string ({protocol!r})")
+        else:
+            proto_upper = protocol.upper()
+            if proto_upper not in {"TCP", "UDP"}:
+                errors.append(
+                    f"[fields] Packet {i}: unsupported protocol '{protocol}', "
+                    f"expected 'TCP' or 'UDP'"
+                )
+
+        # Flags free-form string
+        flags = pkt.get("flags")
+        if not isinstance(flags, str):
+            errors.append(f"[fields] Packet {i}: 'flags' should be string ({flags!r})")
+
+        # SEQ / ACK must be integers
+        for role in ("seq", "ack"):
+            val = pkt.get(role)
+            try:
+                int(val)
+            except (TypeError, ValueError):
+                errors.append(
+                    f"[fields] Packet {i}: '{role}' is not a valid integer ({val!r})"
+                )
+
+        # Payload should be string (we will derive payload_size from its length)
+        payload = pkt.get("payload")
+        if not isinstance(payload, str):
+            errors.append(
+                f"[fields] Packet {i}: 'payload' should be a string ({payload!r})"
+            )
+
+    return errors
+
+
+def _payload_size_from_packet(pkt: Packet) -> int:
+    """
+    Derive a payload size from the 'payload' field.
+    If payload is not a string or missing, treat as 0.
+    """
+    payload = pkt.get("payload", "")
+    if isinstance(payload, str):
+        try:
+            return len(payload.encode("utf-8"))
+        except Exception:
+            return len(payload)
+    return 0
+
+
+def check_tcp_state_machine(packets: List[Packet]) -> List[str]:
+    """
+    Lightweight TCP state-machine check per flow.
+    """
+    errors = []
+
+    # Group TCP packets by flow key
+    flows = {}
+    for i, pkt in enumerate(packets):
+        proto = str(pkt.get("protocol", "")).upper()
+        if proto != "TCP":
             continue
-        if f["tcp_syn"] or f["tcp_syn_ack"] or f["tcp_ack_after_syn"]:
-            tcp_handshake_total += 1
-        if f["tcp_syn"] and f["tcp_syn_ack"] and f["tcp_ack_after_syn"]:
-            tcp_handshake_ok += 1
+        key = get_flow_key(pkt)
+        flows.setdefault(key, []).append((i, pkt))
 
-    # Sort timestamps & compute IATs
-    timestamps_sorted = sorted(timestamps)
-    iats: List[float] = []
-    for i in range(1, len(timestamps_sorted)):
-        dt = timestamps_sorted[i] - timestamps_sorted[i - 1]
-        if dt >= 0:
-            iats.append(dt)
+    for key, pkts in flows.items():
+        pkts_sorted = sorted(pkts, key=lambda x: x[1].get("timestamp", 0.0))
 
-    return {
-        "lengths": np.array(lengths, dtype=float),
-        "timestamps": np.array(timestamps_sorted, dtype=float),
-        "iat": np.array(iats, dtype=float),
-        "flows": flows,
-        "protocol_counts": protocol_counts,
-        "tcp_handshake_total": tcp_handshake_total,
-        "tcp_handshake_ok": tcp_handshake_ok,
-    }
+        syn_seen = False
+        syn_ack_seen = False
+        ack_seen = False
+
+        for idx, (i, pkt) in enumerate(pkts_sorted):
+            flags = str(pkt.get("flags", "")).upper()
+            payload_size = _payload_size_from_packet(pkt)
+
+            # SYN
+            if "SYN" in flags and "ACK" not in flags:
+                if syn_seen:
+                    errors.append(
+                        f"[tcp-sm] Flow {key}: duplicate SYN at packet {i}"
+                    )
+                syn_seen = True
+
+            # SYN-ACK
+            if "SYN" in flags and "ACK" in flags:
+                syn_ack_seen = True
+
+            # pure ACK (after SYN, SYN-ACK)
+            if "ACK" in flags and "SYN" not in flags and syn_seen and syn_ack_seen and not ack_seen:
+                ack_seen = True
+
+            # Data before handshake completion?
+            if payload_size > 0 and not ack_seen:
+                errors.append(
+                    f"[tcp-sm] Flow {key}: data before 3-way handshake completes (pkt {i})"
+                )
+
+        if syn_seen and not (syn_ack_seen and ack_seen):
+            errors.append(
+                f"[tcp-sm] Flow {key}: SYN seen but 3-way handshake not completed"
+            )
+
+        fin_seen = False
+        fin_ack_seen = False
+        for i, pkt in pkts_sorted:
+            flags = str(pkt.get("flags", "")).upper()
+            if "FIN" in flags:
+                fin_seen = True
+            if "FIN" in flags and "ACK" in flags:
+                fin_ack_seen = True
+
+        if fin_seen and not fin_ack_seen:
+            errors.append(
+                f"[tcp-sm] Flow {key}: FIN seen but no FIN-ACK in opposite direction"
+            )
+
+    return errors
 
 
-# -------------------- Helper: 1D KS Distance -------------------- #
-
-def _ks_distance(x: np.ndarray, y: np.ndarray, bins: int = 32) -> float:
+def check_seq_ack_continuity(packets: List[Packet]) -> List[str]:
     """
-    Simple 1D Kolmogorov–Smirnov-like distance between two samples.
-    We approximate CDFs via histograms on a shared range.
+    For each TCP flow & direction:
+    - SEQ non-decreasing, advances on payload
+    - ACK non-decreasing
+
+    设计：
+      - ACK-only 包（payload_size == 0）允许 SEQ 不前进；
+      - 只有 payload_size > 0 且 SEQ 没前进时，打印 warning 而不是 error；
+      - 真正的错误：
+          * SEQ 回退（变小）
+          * ACK 回退（变小）
     """
-    if x.size == 0 or y.size == 0:
-        return float("nan")
+    errors = []
 
-    lo = min(x.min(), y.min())
-    hi = max(x.max(), y.max())
-    if lo == hi:
-        return 0.0
+    flows = {}
+    for i, pkt in enumerate(packets):
+        proto = str(pkt.get("protocol", "")).upper()
+        if proto != "TCP":
+            continue
+        key = get_flow_key(pkt)
+        flows.setdefault(key, []).append((i, pkt))
 
-    hist_x, bin_edges = np.histogram(x, bins=bins, range=(lo, hi), density=True)
-    hist_y, _ = np.histogram(y, bins=bins, range=(lo, hi), density=True)
+    for key, pkts in flows.items():
+        pkts_sorted = sorted(pkts, key=lambda x: x[1].get("timestamp", 0.0))
+        per_dir_state = {}
 
-    cdf_x = np.cumsum(hist_x) * (bin_edges[1] - bin_edges[0])
-    cdf_y = np.cumsum(hist_y) * (bin_edges[1] - bin_edges[0])
+        for i, pkt in pkts_sorted:
+            dir_key = (
+                pkt.get("src_ip"),
+                int(pkt.get("src_port")),
+                pkt.get("dst_ip"),
+                int(pkt.get("dst_port")),
+            )
 
-    return float(np.max(np.abs(cdf_x - cdf_y)))
+            try:
+                seq = int(pkt.get("seq"))
+                ack = int(pkt.get("ack"))
+                payload_size = _payload_size_from_packet(pkt)
+            except (TypeError, ValueError):
+                # Already caught by field_sanity
+                continue
 
+            state = per_dir_state.get(dir_key, {"last_seq": None, "last_ack": None})
+            last_seq = state["last_seq"]
+            last_ack = state["last_ack"]
 
-# -------------------- Metric Computation -------------------- #
+            # ---- SEQ ----
+            if last_seq is not None:
+                if seq < last_seq:
+                    errors.append(
+                        f"[seq/ack] Flow {key}, dir {dir_key}: "
+                        f"SEQ decreased at pkt {i} ({seq} < {last_seq})"
+                    )
+                # ACK-only 情况：payload_size == 0 时可以不前进
+                if payload_size > 0 and seq == last_seq:
+                    # 打印 warning，但不作为错误
+                    print(
+                        f"[validator-warning] Flow {key}, dir {dir_key}: "
+                        f"payload_size={payload_size} but SEQ did not advance at pkt {i}"
+                    )
 
-def _compute_statistical_fidelity(gen: Dict[str, Any], base: Dict[str, Any]) -> Dict[str, Any]:
-    x = gen["lengths"]
-    y = base["lengths"]
+            # ---- ACK ----
+            if last_ack is not None and ack < last_ack:
+                errors.append(
+                    f"[seq/ack] Flow {key}, dir {dir_key}: "
+                    f"ACK decreased at pkt {i} ({ack} < {last_ack})"
+                )
 
-    return {
-        "gen_pkt_len_mean": float(np.mean(x)) if x.size > 0 else float("nan"),
-        "gen_pkt_len_std": float(np.std(x)) if x.size > 0 else float("nan"),
-        "base_pkt_len_mean": float(np.mean(y)) if y.size > 0 else float("nan"),
-        "base_pkt_len_std": float(np.std(y)) if y.size > 0 else float("nan"),
-        "pkt_len_ks_distance": _ks_distance(x, y),
-        "gen_num_packets": int(x.size),
-        "base_num_packets": int(y.size),
-    }
+            state["last_seq"] = seq
+            state["last_ack"] = ack
+            per_dir_state[dir_key] = state
 
-
-def _compute_temporal_dynamics(gen: Dict[str, Any], base: Dict[str, Any]) -> Dict[str, Any]:
-    x = gen["iat"]
-    y = base["iat"]
-
-    return {
-        "gen_iat_mean": float(np.mean(x)) if x.size > 0 else float("nan"),
-        "gen_iat_std": float(np.std(x)) if x.size > 0 else float("nan"),
-        "base_iat_mean": float(np.mean(y)) if y.size > 0 else float("nan"),
-        "base_iat_std": float(np.std(y)) if y.size > 0 else float("nan"),
-        "iat_ks_distance": _ks_distance(x, y),
-        "gen_num_iat": int(x.size),
-        "base_num_iat": int(y.size),
-    }
-
-
-def _compute_protocol_behavior_consistency(gen: Dict[str, Any], base: Dict[str, Any]) -> Dict[str, Any]:
-    pc_gen = gen["protocol_counts"]
-    pc_base = base["protocol_counts"]
-
-    # Simple TCP handshake success ratio
-    gen_total = gen["tcp_handshake_total"]
-    gen_ok = gen["tcp_handshake_ok"]
-    base_total = base["tcp_handshake_total"]
-    base_ok = base["tcp_handshake_ok"]
-
-    def _ratio(ok: int, total: int) -> float:
-        if total == 0:
-            return float("nan")
-        return float(ok / total)
-
-    return {
-        "gen_protocol_counts": pc_gen,
-        "base_protocol_counts": pc_base,
-        "gen_tcp_handshake_total": int(gen_total),
-        "gen_tcp_handshake_ok": int(gen_ok),
-        "gen_tcp_handshake_success_ratio": _ratio(gen_ok, gen_total),
-        "base_tcp_handshake_total": int(base_total),
-        "base_tcp_handshake_ok": int(base_ok),
-        "base_tcp_handshake_success_ratio": _ratio(base_ok, base_total),
-    }
-
-
-def _compute_semantic_realism(gen: Dict[str, Any], base: Dict[str, Any]) -> Dict[str, Any]:
-    flows_gen: Dict[FlowKey, Dict[str, Any]] = gen["flows"]
-    flows_base: Dict[FlowKey, Dict[str, Any]] = base["flows"]
-
-    def _flow_stats(flows: Dict[FlowKey, Dict[str, Any]]) -> Dict[str, float]:
-        num_flows = len(flows)
-        if num_flows == 0:
-            return {
-                "num_flows": 0,
-                "avg_pkts_per_flow": float("nan"),
-                "avg_flow_duration": float("nan"),
-            }
-
-        pkt_counts = []
-        durations = []
-        for f in flows.values():
-            pkt_counts.append(f["pkt_count"])
-            durations.append(max(0.0, f["last_ts"] - f["first_ts"]))
-
-        return {
-            "num_flows": num_flows,
-            "avg_pkts_per_flow": float(np.mean(pkt_counts)),
-            "avg_flow_duration": float(np.mean(durations)),
-        }
-
-    stats_gen = _flow_stats(flows_gen)
-    stats_base = _flow_stats(flows_base)
-
-    return {
-        "gen": stats_gen,
-        "base": stats_base,
-    }
-
-
-def _compute_distance_to_real_trace(stat_fid: Dict[str, Any],
-                                    temp_dyn: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Summarize key distance metrics between generated and real trace.
-
-    Here we re-use:
-      - pkt_len_ks_distance
-      - iat_ks_distance
-    as principled distribution-level distances.
-    """
-    return {
-        "pkt_len_ks_distance": float(stat_fid.get("pkt_len_ks_distance", float("nan"))),
-        "iat_ks_distance": float(temp_dyn.get("iat_ks_distance", float("nan"))),
-    }
+    return errors
 
 
 # -------------------- Public API -------------------- #
 
-def evaluate_pcap(generated_pcap: str, baseline_pcap: str) -> Dict[str, Any]:
+def validate_trace(packets: List[Packet]) -> List[str]:
     """
-    Main entrypoint used by llm_generate.py.
-
-    Arguments:
-      generated_pcap: path to the PCAP produced from LLM-generated JSON.
-      baseline_pcap:  path to a real-world baseline PCAP trace.
-
-    Returns:
-      A dictionary with five top-level sections:
-
-        {
-          "statistical_fidelity": {...},
-          "temporal_dynamics": {...},
-          "protocol_behavior_consistency": {...},
-          "semantic_realism": {...},
-          "distance_to_real_trace": {...}
-        }
+    Main validator: return a list of error strings.
+    If list is empty -> validation PASSED.
     """
-    gen_stats = _parse_pcap(generated_pcap)
-    base_stats = _parse_pcap(baseline_pcap)
+    errors: List[str] = []
+    errors.extend(check_timestamp_consistency(packets))
+    errors.extend(check_ip_port_pairing(packets))
+    errors.extend(check_payload_and_field_sanity(packets))
+    errors.extend(check_tcp_state_machine(packets))
+    errors.extend(check_seq_ack_continuity(packets))
+    return errors
 
-    stat_fid = _compute_statistical_fidelity(gen_stats, base_stats)
-    temp_dyn = _compute_temporal_dynamics(gen_stats, base_stats)
-    proto_cons = _compute_protocol_behavior_consistency(gen_stats, base_stats)
-    sem_real = _compute_semantic_realism(gen_stats, base_stats)
-    dist_real = _compute_distance_to_real_trace(stat_fid, temp_dyn)
 
-    return {
-        "statistical_fidelity": stat_fid,
-        "temporal_dynamics": temp_dyn,
-        "protocol_behavior_consistency": proto_cons,
-        "semantic_realism": sem_real,
-        "distance_to_real_trace": dist_real,
-    }
+def validate_trace_file(path: str) -> List[str]:
+    packets = load_trace(path)
+    return validate_trace(packets)
+
+
+# -------------------- CLI entrypoint -------------------- #
+
+def _main_cli() -> None:
+    parser = argparse.ArgumentParser(
+        description="Validate an LLM-generated network packet trace (JSON)."
+    )
+    parser.add_argument("json_path", help="Path to JSON trace file.")
+    args = parser.parse_args()
+
+    try:
+        errors = validate_trace_file(args.json_path)
+    except Exception as e:
+        print(f"[fatal] Failed to load/validate JSON trace: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if errors:
+        print("Validation FAILED.")
+        print(f"Total errors: {len(errors)}")
+        for err in errors:
+            print(" -", err)
+        sys.exit(1)
+    else:
+        print("Validation PASSED.")
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    _main_cli()
